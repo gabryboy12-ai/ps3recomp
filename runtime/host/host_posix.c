@@ -74,6 +74,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 
@@ -839,14 +840,141 @@ static void emit_quad_draws(void)
  * title does. The RSX's `get` pointer lives inside cellGcmSys and chases `put`;
  * it is never rewound, so each frame must occupy fresh ring space rather than
  * overwrite the last one. */
+/* ---------------------------------------------------------------------------
+ * --demo: an animated showcase scene, not a check
+ *
+ * Everything goes the same way the checks above do -- guest memory, NV4097
+ * methods through the FIFO, the backend's fixed-function fallback -- so what
+ * it shows is what the backend really does with a command stream. A textured
+ * square spins in the middle; three flat triangles orbit it at varying depth,
+ * so the depth test decides who covers whom as they pass in front and behind.
+ * The texture's top-left cell is red, which makes its orientation visible.
+ *
+ * Once the ring passes DEMO_RING_WRAP it JUMPs back to its start, as a
+ * title's ring does, so the scene can run indefinitely with --frames=0.
+ * No pixel is asserted.
+ * -----------------------------------------------------------------------*/
+#define DEMO_TEX_OFFSET   0x001C0000u     /* past MRT_B's surface            */
+#define DEMO_TEX_DIM      64u
+#define DEMO_TRI_OFFSET   0x001D0000u     /* 9 vertices, stride 32           */
+#define DEMO_QUAD_OFFSET  0x001D1000u     /* 6 vertices, stride 48           */
+#define DEMO_RING_WRAP    0x8000u         /* well inside CMD_SIZE; a frame is
+                                             a few hundred bytes            */
+
+static void upload_demo_texture(void)
+{
+    for (u32 y = 0; y < DEMO_TEX_DIM; y++)
+        for (u32 x = 0; x < DEMO_TEX_DIM; x++) {
+            u32 argb;
+            if (x < 8u && y < 8u) {
+                argb = 0xFFE02020u;                      /* the orientation mark */
+            } else if (((x >> 3) ^ (y >> 3)) & 1u) {
+                argb = 0xFFF0F0F0u;                      /* light cells          */
+            } else {
+                u32 r = 0x30u + x * 3u, g = 0x30u + y * 3u;
+                argb = 0xFF000000u | (r << 16) | (g << 8) | 0xC0u;   /* gradient */
+            }
+            guest_w32(IO_ADDR + DEMO_TEX_OFFSET + (y * DEMO_TEX_DIM + x) * 4u, argb);
+        }
+}
+
+static void demo_vertex(u32 base, u32 stride, u32 i, const float* f, int n)
+{
+    for (int k = 0; k < n; k++)
+        guest_f32(IO_ADDR + base + i * stride + (u32)k * 4u, f[k]);
+}
+
+/* Geometry for time t (seconds). NDC is stretched over 16:9, so x is scaled
+ * by 720/1280 to keep the square square. */
+static void upload_demo_geometry(float t)
+{
+    const float ax = 720.0f / 1280.0f;
+
+    /* The square: z = 0.5, white vertex colour, texcoords with v = 0 at the
+     * top edge (texture row 0 is the first row in memory). */
+    const float h = 0.55f, c = cosf(0.8f * t), s = sinf(0.8f * t);
+    static const float corner[4][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+    static const float uv[4][2]     = { {  0,  1 }, { 1,  1 }, { 1, 0 }, {  0, 0 } };
+    static const int   order[6]     = { 0, 1, 2, 0, 2, 3 };
+    for (u32 i = 0; i < 6; i++) {
+        int k = order[i];
+        float x = corner[k][0] * h, y = corner[k][1] * h;
+        float v[12] = { (x * c - y * s) * ax, x * s + y * c, 0.5f, 1.0f,
+                        1.0f, 1.0f, 1.0f, 1.0f,
+                        uv[k][0], uv[k][1], 0.0f, 0.0f };
+        demo_vertex(DEMO_QUAD_OFFSET, 48u, i, v, 12);
+    }
+
+    /* Three triangles on an orbit of radius 0.62, each spinning on itself;
+     * z swings between 0.2 (in front of the square) and 0.8 (behind it). */
+    static const float col[3][3] = { { 1.0f, 0.2f, 0.2f }, { 0.2f, 1.0f, 0.3f }, { 0.3f, 0.5f, 1.0f } };
+    const float tau = 6.2831853f;
+    for (u32 k = 0; k < 3; k++) {
+        float orbit = 0.9f * t + tau * (float)k / 3.0f;
+        float px = 0.62f * cosf(orbit), py = 0.62f * sinf(orbit);
+        float z  = 0.5f + 0.3f * sinf(orbit * 2.0f);
+        float spin = 2.0f * t + (float)k;
+        for (u32 j = 0; j < 3; j++) {
+            float a = spin + tau * (float)j / 3.0f;
+            float v[8] = { (px + 0.2f * cosf(a)) * ax, py + 0.2f * sinf(a), z, 1.0f,
+                           col[k][0], col[k][1], col[k][2], 1.0f };
+            demo_vertex(DEMO_TRI_OFFSET, 32u, k * 3u + j, v, 8);
+        }
+    }
+}
+
+static void emit_demo_draws(void)
+{
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 1u);
+    emit(NV4097_SET_DEPTH_FUNC,        0x0201u);   /* GL_LESS */
+    emit(NV4097_SET_DEPTH_MASK,        1u);
+
+    /* The triangles: position + flat colour. Texcoord0 is switched OFF
+     * (size 0), or the fallback path would texture them with the unit the
+     * square left bound on the previous frame. */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(DEMO_TRI_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(DEMO_TRI_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8 * 4, VFMT(0, 0));
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES       */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((9u - 1u) << 24));   /* first=0 count=9 */
+    emit(NV4097_SET_BEGIN_END, 0u);
+
+    /* The square: texture unit 0, A8R8G8B8 linear, packed as in
+     * emit_textured_draw_fmt. */
+    emit(NV4097_SET_TEXTURE_OFFSET     + 0, DEMO_TEX_OFFSET);
+    emit(NV4097_SET_TEXTURE_FORMAT     + 0, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+    emit(NV4097_SET_TEXTURE_CONTROL0   + 0, 0x80000000u);
+    emit(NV4097_SET_TEXTURE_CONTROL1   + 0, 0xAAE4u);
+    emit(NV4097_SET_TEXTURE_IMAGE_RECT + 0, (DEMO_TEX_DIM << 16) | DEMO_TEX_DIM);
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(DEMO_QUAD_OFFSET +  0));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(DEMO_QUAD_OFFSET + 16));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 48));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 8 * 4, VTX_MAIN(DEMO_QUAD_OFFSET + 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 8 * 4, VFMT(4, 48));
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   0u | ((6u - 1u) << 24));
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 static void submit_frame(int with_draw)
 {
+    if (with_draw == 11 && g_fifo_len > DEMO_RING_WRAP) {
+        /* --demo wraps its ring the way a title does: a JUMP back to IO
+         * offset 0 (0x20000000 | offset, as cellGcmSys.c decodes it) at the
+         * write head, then this frame is written from the start. The walker
+         * keeps its own get, so it has to be led there by the ring itself. */
+        guest_w32(IO_ADDR + g_fifo_len, 0x20000000u | 0u);
+        g_fifo_len = 0;
+    }
     /* The MRT modes clear twice, once per target set, and emit both clears
      * themselves so the display's lands after the offscreen pass rather than
      * in front of it. */
     if (with_draw != 9 && with_draw != 10) {
         emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
-        if (with_draw == 4) {
+        if (with_draw == 4 || with_draw == 11) {
             /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four
              * colour channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00
              * is depth 1.0 and stencil 0 -- the nv40 reset values, and what a
@@ -857,7 +985,8 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 10)     emit_mrt_draws(0);
+    if (with_draw == 11)     emit_demo_draws();
+    else if (with_draw == 10) emit_mrt_draws(0);
     else if (with_draw == 9) emit_mrt_draws(1);
     else if (with_draw == 8) emit_depthtex_draws();
     else if (with_draw == 7) emit_quad_draws();
@@ -1156,6 +1285,8 @@ int main(int argc, char** argv)
          * target A, since a centre-pixel readback can only speak for one. */
         else if (strcmp(argv[i], "--mrt") == 0)   do_draw = 9;
         else if (strcmp(argv[i], "--mrt-a") == 0) do_draw = 10;
+        /* --demo: the animated showcase scene above. Checks nothing. */
+        else if (strcmp(argv[i], "--demo") == 0)  do_draw = 11;
     }
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
@@ -1191,6 +1322,7 @@ int main(int argc, char** argv)
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
     if (do_draw == 7) upload_quad_geometry();
+    if (do_draw == 11) { upload_demo_texture(); upload_demo_geometry(0.0f); }
     /* --depthtex draws both too: the flat triangle into the zeta, the quad
      * out of it. */
     if (do_draw == 8) {
@@ -1219,7 +1351,10 @@ int main(int argc, char** argv)
         if (host_backend_pump() < 0) { printf("[host] window closed\n"); break; }
         /* Re-submit every frame, as a title does: the backend records draws
          * per frame and clears the record when it presents. */
-        if (i > 0) submit_frame(do_draw);
+        if (i > 0) {
+            if (do_draw == 11) upload_demo_geometry((float)i / 60.0f);
+            submit_frame(do_draw);
+        }
         cellGcmTickVBlank();
         cellGcmTickFlip();
         if (cellGcm_take_flip_pending_synced()) presented++;
@@ -1229,7 +1364,8 @@ int main(int argc, char** argv)
 
     u32 back = host_backend_center();
     int rc = (got == CLEAR_ARGB) ? 0 : 2;
-    if (back) {
+    if (do_draw == 11) printf("[host] --demo: showcase scene, no pixel check\n");
+    if (back && do_draw != 11) {
         /* Headless: the drawable is ours, so verify what actually landed.
          * RSX ARGB -> Metal BGRA8Unorm keeps R, G and B in the same bytes. */
         /* Without a draw the centre pixel is the clear colour; with the test
