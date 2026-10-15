@@ -16,6 +16,7 @@
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_census.h"   /* SPU_CENSUS=1: per-image run time */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
@@ -201,6 +202,7 @@ void spu_stop(spu_context* ctx)
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+    const uint64_t census_t0 = spu_census_begin();   /* SPU_CENSUS=1 */
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */
@@ -272,6 +274,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
+    spu_census_end(ctx->image_id, census_t0);
     return halted;
 }
 
