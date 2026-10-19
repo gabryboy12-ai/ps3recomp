@@ -274,7 +274,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
-    spu_census_end(ctx->image_id, census_t0);
+    spu_census_end(ctx, ctx->image_id, census_t0);
     return halted;
 }
 

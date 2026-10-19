@@ -7,6 +7,7 @@
  */
 #include "spu_interp.h"
 #include "spu_helpers.h"
+#include "spu_census.h"   /* SPU_CENSUS=1: time spent interpreting, per image */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -389,7 +390,18 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    /* A longjmp out of the interpreter skips the end of this bracket;
+     * spu_run_with_halt's spu_census_end() closes it. */
+    spu_census_interp_begin(ctx, ctx->image_id);
+    const uint32_t r = spu_interp_run_until_body(ctx, start_lsa, stop_lsa);
+    spu_census_interp_end(ctx);
+    return r;
+}
+
+static uint32_t spu_interp_run_until_body(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
